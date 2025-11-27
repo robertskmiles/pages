@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supersillyus</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            background: #111;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        h1 {
+            margin: 10px 0;
+            font-size: 24px;
+        }
+        #gameContainer {
+            position: relative;
+            display: inline-block;
+            flex-grow: 1;
+            width: 100%;
+        }
+        canvas {
+            border: none;
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            display: none;
+            transform: scaleX(-1);  /* Mirror the video */
+            object-fit: cover;
+        }
+        #controls {
+            margin: 10px 0;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        button {
+            padding: 8px 16px;
+            font-size: 14px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        #status {
+            margin: 5px 0 10px 0;
+            padding: 8px;
+            background: #333;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        #debugInfo {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            display: none;
+            z-index: 100;
+        }
+        .checkbox-container {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        label {
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <h1>Supersillyus</h1>
+    <div id="gameContainer">
+        <canvas id="gameCanvas"></canvas>
+        <video id="video" autoplay playsinline></video>
+        <canvas id="faceCanvas" style="display:none;"></canvas>
+        <div id="debugInfo"></div>
+    </div>
+    <div id="controls">
+        <button id="startBtn">Start Game</button>
+        <div class="checkbox-container">
+            <label>
+                <input type="checkbox" id="showVideo" onchange="toggleVideo()">
+                Show Video Feed
+            </label>
+            <label>
+                <input type="checkbox" id="showDebug" onchange="toggleDebug()">
+                Show Debug
+            </label>
+        </div>
+    </div>
+    <div id="status">Click "Start Game" to begin. Raise your eyebrows to move your paddle up!</div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+        // Game state
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const video = document.getElementById('video');
+        const faceCanvas = document.getElementById('faceCanvas');
+        const faceCtx = faceCanvas.getContext('2d');
+        const statusDiv = document.getElementById('status');
+        const debugDiv = document.getElementById('debugInfo');
+        const startBtn = document.getElementById('startBtn');
+        
+        // Canvas dimensions - fill the window
+        let WIDTH = window.innerWidth;
+        let HEIGHT = window.innerHeight - 150; // Leave space for controls
+        
+        function resizeCanvas() {
+            WIDTH = window.innerWidth;
+            HEIGHT = window.innerHeight - 150;
+            canvas.width = WIDTH;
+            canvas.height = HEIGHT;
+            video.width = WIDTH;
+            video.height = HEIGHT;
+            // faceCanvas size will be matched to the video frame once the stream is ready
+        }
+        
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+
+        // Game objects
+        class Player {
+            constructor(side) {
+                this.side = side;
+                this.score = 0;
+                this.paddleY = HEIGHT / 2;
+                this.targetY = HEIGHT / 2;
+                this.browRatio = 0.5;
+                this.browHigh = -1;  // Start at same value for quick calibration
+                this.browLow = 1;   // Start at same value for quick calibration
+                this.norm = 0.5;     // Smoothed normalized value
+                this.newNorm = 0.5;   // Raw normalized value before smoothing
+                this.color = side === 0 ? '#96ff96' : '#9696ff';
+                this.faceDetected = false;
+                this.faceImage = null;
+                this.faceBounds = null;
+                this.landmarks = null;
+            }
+
+            updatePaddle() {
+                // Smooth paddle movement
+                const diff = this.targetY - this.paddleY;
+                this.paddleY += diff * 0.15;
+            }
+        }
+
+        class Ball {
+            constructor() {
+                this.radius = 10;
+                this.reset();
+            }
+
+            reset() {
+                this.x = WIDTH / 2;
+                this.y = HEIGHT / 2;
+                this.vx = (Math.random() > 0.5 ? 1 : -1) * 8;
+                this.vy = (Math.random() - 0.5) * 4;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+
+                // Bounce off top and bottom
+                if (this.y - this.radius <= 0 || this.y + this.radius >= HEIGHT) {
+                    this.vy = -this.vy;
+                    this.y = Math.max(this.radius, Math.min(HEIGHT - this.radius, this.y));
+                }
+            }
+        }
+
+        // Initialize game objects
+        const players = [new Player(0), new Player(1)];
+        const ball = new Ball();
+        const paddleWidth = 10;
+        const paddleHeight = 70;
+        let gameRunning = false;
+        let faceMesh = null;
+        let camera = null;
+
+        // MediaPipe face landmarks indices
+        const LANDMARKS = {
+            LEFT_EYEBROW_TOP: [70, 63, 105, 66, 107],
+            LEFT_EYEBROW_BOTTOM: [35, 31, 228, 229, 230],
+            RIGHT_EYEBROW_TOP: [336, 296, 334, 293, 300],
+            RIGHT_EYEBROW_BOTTOM: [261, 340, 346, 347, 348],
+            LEFT_EYE_BOTTOM: [33, 7, 163, 144, 145],
+            RIGHT_EYE_BOTTOM: [362, 398, 384, 385, 386]
+        };
+
+        function calculateEyebrowRatio(landmarks) {
+            if (!landmarks || landmarks.length === 0) return null;
+
+            // --- Compute average vertical brow-eye distance (like Python version) ---
+            let leftBrowTop = 0;
+            let leftEyeBottom = 0;
+            let count = 0;
+
+            let leftMinX = Infinity;
+            let leftMaxX = -Infinity;
+
+            LANDMARKS.LEFT_EYEBROW_TOP.forEach(idx => {
+                const lm = landmarks[idx];
+                leftBrowTop += lm.y;
+                count++;
+                if (lm.x < leftMinX) leftMinX = lm.x;
+                if (lm.x > leftMaxX) leftMaxX = lm.x;
+            });
+            leftBrowTop /= count;
+
+            count = 0;
+            LANDMARKS.LEFT_EYE_BOTTOM.forEach(idx => {
+                leftEyeBottom += landmarks[idx].y;
+                count++;
+            });
+            leftEyeBottom /= count;
+
+            const leftBrowDist = Math.abs(leftEyeBottom - leftBrowTop);
+            const leftBrowWidth = Math.max(1e-6, leftMaxX - leftMinX);
+
+            // Do the same for right eyebrow
+            let rightBrowTop = 0;
+            let rightEyeBottom = 0;
+            count = 0;
+
+            let rightMinX = Infinity;
+            let rightMaxX = -Infinity;
+
+            LANDMARKS.RIGHT_EYEBROW_TOP.forEach(idx => {
+                const lm = landmarks[idx];
+                rightBrowTop += lm.y;
+                count++;
+                if (lm.x < rightMinX) rightMinX = lm.x;
+                if (lm.x > rightMaxX) rightMaxX = lm.x;
+            });
+            rightBrowTop /= count;
+
+            count = 0;
+            LANDMARKS.RIGHT_EYE_BOTTOM.forEach(idx => {
+                rightEyeBottom += landmarks[idx].y;
+                count++;
+            });
+            rightEyeBottom /= count;
+
+            const rightBrowDist = Math.abs(rightEyeBottom - rightBrowTop);
+            const rightBrowWidth = Math.max(1e-6, rightMaxX - rightMinX);
+
+            // Average of both eyebrows
+            const meanBrowDist = (leftBrowDist + rightBrowDist) / 2;
+            const meanBrowWidth = (leftBrowWidth + rightBrowWidth) / 2;
+
+            if (meanBrowWidth <= 0) return null;
+
+            // Scale-invariant ratio (distance / width), like the Python version
+            const ratio = meanBrowDist / meanBrowWidth;
+            return ratio;
+        }
+
+        function onFaceResults(results) {
+            if (!gameRunning) return;
+
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                // Ensure faceCanvas matches the video frame's intrinsic resolution to avoid stretching
+                if (video.videoWidth && video.videoHeight) {
+                    if (faceCanvas.width !== video.videoWidth || faceCanvas.height !== video.videoHeight) {
+                        faceCanvas.width = video.videoWidth;
+                        faceCanvas.height = video.videoHeight;
+                    }
+                }
+
+                // Draw the current video frame to the face canvas
+                faceCtx.drawImage(video, 0, 0, faceCanvas.width, faceCanvas.height);
+
+                // Sort faces by size (approximate by x-coordinate span)
+                const faces = results.multiFaceLandmarks.map(landmarks => {
+                    const minX = Math.min(...landmarks.map(l => l.x));
+                    const maxX = Math.max(...landmarks.map(l => l.x));
+                    const minY = Math.min(...landmarks.map(l => l.y));
+                    const maxY = Math.max(...landmarks.map(l => l.y));
+                    const centerX = (minX + maxX) / 2;
+                    const centerY = (minY + maxY) / 2;
+                    const size = maxX - minX;
+                    return { landmarks, centerX, centerY, minX, maxX, minY, maxY, size };
+                }).sort((a, b) => b.size - a.size);
+
+                // Process up to 2 faces
+                for (let i = 0; i < Math.min(2, faces.length); i++) {
+                    const face = faces[i];
+                    // Video is mirrored, so flip the logic
+                    const playerIdx = face.centerX > 0.5 ? 0 : 1;
+                    const player = players[playerIdx];
+
+                    // Capture face region
+                    const padding = 1; // Add some padding around the face
+                    const faceWidth = (face.maxX - face.minX) * faceCanvas.width * padding;
+                    const faceHeight = (face.maxY - face.minY) * faceCanvas.height * padding;
+                    const faceCenterX = face.centerX * faceCanvas.width;
+                    const faceCenterY = face.centerY * faceCanvas.height;
+
+                    // Create a circular crop of the face
+                    const cropSize = Math.max(faceWidth, faceHeight);
+                    if (cropSize < 1 || !Number.isFinite(cropSize)) {
+                        // Too small or invalid; skip this face for rendering
+                        player.faceImage = null;
+                        player.faceBounds = null;
+                        player.landmarks = null;
+                        continue;
+                    }
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = cropSize;
+                    tempCanvas.height = cropSize;
+                    const tempCtx = tempCanvas.getContext('2d');
+
+                    // Draw the face region
+                    tempCtx.drawImage(
+                        faceCanvas,
+                        faceCenterX - cropSize/2, faceCenterY - cropSize/2, cropSize, cropSize,
+                        0, 0, cropSize, cropSize
+                    );
+
+                    // Store the face image
+                    player.faceImage = tempCanvas;
+                    player.faceBounds = {
+                        centerX: faceCenterX,
+                        centerY: faceCenterY,
+                        size: cropSize
+                    };
+                    // Store landmarks so we can overdraw eyebrows on the big face later
+                    player.landmarks = face.landmarks;
+
+                    const ratio = calculateEyebrowRatio(face.landmarks);
+                    if (ratio !== null) {
+                        player.faceDetected = true;
+                        player.browRatio = ratio;
+
+                        // Auto-calibration exactly like Python version
+                        player.browHigh -= 0.001;  // High slowly decreases
+                        player.browLow += 0.001;   // Low slowly increases (slower than high)
+
+                        // Adjust if current ratio exceeds bounds with dampening (match Python)
+                        if (ratio > player.browHigh) {
+                            player.browHigh = player.browHigh + ((ratio - player.browHigh) / 4);
+                        }
+                        if (ratio < player.browLow) {
+                            player.browLow = player.browLow + ((ratio - player.browLow) / 4);
+                        }
+
+                        // Calculate new normalized value (0-1)
+                        player.newNorm = (ratio - player.browLow) / (player.browHigh - player.browLow);
+                        player.newNorm = Math.max(0, Math.min(1, player.newNorm));
+
+                        // Smooth the normalized value
+                        player.norm = player.norm + ((player.newNorm - player.norm) / 3);
+
+                        // Set target paddle position - higher norm (raised eyebrows) moves paddle up
+                        player.targetY = HEIGHT - (player.norm * HEIGHT);
+                    }
+                }
+
+                // Update debug info
+                if (debugDiv.style.display !== 'none') {
+                    let debugText = `Faces detected: ${faces.length}\n`;
+                    players.forEach((player, idx) => {
+                        if (player.faceDetected) {
+                            debugText += `\nPlayer ${idx + 1}:\n`;
+                            debugText += `  Ratio: ${player.browRatio.toFixed(3)}\n`;
+                            debugText += `  NewNorm: ${player.newNorm.toFixed(2)}\n`;
+                            debugText += `  Norm: ${player.norm.toFixed(2)}\n`;
+                            debugText += `  Low: ${player.browLow.toFixed(3)}\n`;
+                            debugText += `  High: ${player.browHigh.toFixed(3)}\n`;
+                        }
+                    });
+                    debugDiv.innerText = debugText;
+                }
+            }
+        }
+
+        function initFaceDetection() {
+            faceMesh = new FaceMesh({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+                }
+            });
+
+            faceMesh.setOptions({
+                maxNumFaces: 2,
+                refineLandmarks: false,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            faceMesh.onResults(onFaceResults);
+
+            camera = new Camera(video, {
+                onFrame: async () => {
+                    if (faceMesh && gameRunning) {
+                        await faceMesh.send({ image: video });
+                    }
+                },
+                width: WIDTH,
+                height: HEIGHT
+            });
+        }
+
+        function checkPaddleCollision() {
+            const ballLeft = ball.x - ball.radius;
+            const ballRight = ball.x + ball.radius;
+            const ballTop = ball.y - ball.radius;
+            const ballBottom = ball.y + ball.radius;
+
+            // Left paddle (Player 0)
+            if (ballLeft <= 15 && ball.vx < 0) {
+                const paddleTop = players[0].paddleY - paddleHeight;
+                const paddleBottom = players[0].paddleY + paddleHeight;
+                
+                if (ballBottom >= paddleTop && ballTop <= paddleBottom) {
+                    ball.x = 15 + ball.radius;
+                    ball.vx = Math.abs(ball.vx) * 1.05;
+                    ball.vy += (ball.y - players[0].paddleY) * 0.1;
+                } else if (ballLeft < 0) {
+                    // Player 1 scores
+                    players[1].score++;
+                    ball.reset();
+                }
+            }
+
+            // Right paddle (Player 1)
+            if (ballRight >= WIDTH - 15 && ball.vx > 0) {
+                const paddleTop = players[1].paddleY - paddleHeight;
+                const paddleBottom = players[1].paddleY + paddleHeight;
+                
+                if (ballBottom >= paddleTop && ballTop <= paddleBottom) {
+                    ball.x = WIDTH - 15 - ball.radius;
+                    ball.vx = -Math.abs(ball.vx) * 1.05;
+                    ball.vy += (ball.y - players[1].paddleY) * 0.1;
+                } else if (ballRight > WIDTH) {
+                    // Player 0 scores
+                    players[0].score++;
+                    ball.reset();
+                }
+            }
+        }
+
+
+        // Draw thick eyebrows over the face circle, using the player's color
+        function drawPlayerEyebrows(player, cx, cy, radius) {
+            if (!player.faceImage || !player.faceBounds || !player.landmarks) return;
+
+            const fb = player.faceBounds;
+            const cropSize = fb.size;
+            const scale = (radius * 2) / cropSize;
+            const faceLeft = cx - radius;
+            const faceTop = cy - radius;
+
+            ctx.save();
+            ctx.strokeStyle = player.color;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.lineWidth = Math.max(2, radius * 0.08); // thickness scales with face size
+
+            function drawBrow(indices) {
+                let started = false;
+                ctx.beginPath();
+                for (let i = 0; i < indices.length; i++) {
+                    const idx = indices[i];
+                    const lm = player.landmarks[idx];
+                    if (!lm) continue;
+
+                    // Landmark position in video pixels
+                    const videoX = lm.x * faceCanvas.width;
+                    const videoY = lm.y * faceCanvas.height;
+
+                    // Convert to crop coordinates (same region we used when building faceImage)
+                    const cropX = videoX - (fb.centerX - cropSize / 2);
+                    const cropY = videoY - (fb.centerY - cropSize / 2);
+
+                    // Map into on-screen circle
+                    const screenX = faceLeft + cropX * scale;
+                    const screenY = faceTop + cropY * scale;
+
+                    if (!started) {
+                        ctx.moveTo(screenX, screenY);
+                        started = true;
+                    } else {
+                        ctx.lineTo(screenX, screenY);
+                    }
+                }
+                if (started) {
+                    ctx.stroke();
+                }
+            }
+
+            // Roughly corresponds to dlib's 17-20 and 22-25 segments in the Python version
+            drawBrow(LANDMARKS.LEFT_EYEBROW_TOP);
+            drawBrow(LANDMARKS.RIGHT_EYEBROW_TOP);
+
+            // Optional debug: draw small dots and indices at eyebrow landmarks
+            const DEBUG_EYEBROW_POINTS = false;
+            if (DEBUG_EYEBROW_POINTS) {
+                ctx.save();
+                ctx.fillStyle = '#ff0000';
+                ctx.font = Math.max(10, radius * 0.12) + 'px Arial';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                const allIdx = [
+                    ...LANDMARKS.LEFT_EYEBROW_TOP,
+                    ...LANDMARKS.RIGHT_EYEBROW_TOP,
+                    ...LANDMARKS.LEFT_EYEBROW_BOTTOM,
+                    ...LANDMARKS.RIGHT_EYEBROW_BOTTOM
+                ];
+                allIdx.forEach(i => {
+                    const lm = player.landmarks[i];
+                    if (!lm) return;
+                    const videoX = lm.x * faceCanvas.width;
+                    const videoY = lm.y * faceCanvas.height;
+                    const cropX = videoX - (fb.centerX - cropSize / 2);
+                    const cropY = videoY - (fb.centerY - cropSize / 2);
+                    const screenX = faceLeft + cropX * scale;
+                    const screenY = faceTop + cropY * scale;
+                    ctx.beginPath();
+                    ctx.arc(screenX, screenY, Math.max(2, radius * 0.03), 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.fillText(String(i), screenX, screenY - radius * 0.05);
+                });
+                ctx.restore();
+            }
+
+            ctx.restore();
+        }
+
+        function gameLoop() {
+            if (!gameRunning) return;
+
+            // Clear canvas
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            // Calculate face circle radius - much bigger now
+            const faceRadius = Math.min(WIDTH * 0.22, HEIGHT * 0.35);
+
+            // Draw large static face backgrounds
+            players.forEach((player, idx) => {
+                const x = idx === 0 ? WIDTH * 0.25 : WIDTH * 0.75;
+                const y = HEIGHT / 2;
+                
+                ctx.save();
+                
+                // Semi-transparent background circle
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+                ctx.beginPath();
+                ctx.arc(x, y, faceRadius + 5, 0, Math.PI * 2);
+                ctx.fill();
+                
+                // Draw circle border
+                ctx.strokeStyle = player.color;
+                ctx.lineWidth = 3;
+                ctx.globalAlpha = 0.5;
+                ctx.beginPath();
+                ctx.arc(x, y, faceRadius, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+                
+                // Create circular clipping mask
+                ctx.beginPath();
+                ctx.arc(x, y, faceRadius, 0, Math.PI * 2);
+                ctx.clip();
+                
+                // Draw face image if available
+                if (player.faceImage && player.faceImage.width > 0 && player.faceImage.height > 0) {
+                    ctx.globalAlpha = 0.6; // Make faces semi-transparent
+                    ctx.drawImage(
+                        player.faceImage,
+                        x - faceRadius, y - faceRadius,
+                        faceRadius * 2, faceRadius * 2
+                    );
+                    ctx.globalAlpha = 1;
+                } else {
+                    // Draw placeholder
+                    ctx.fillStyle = 'rgba(34, 34, 34, 0.5)';
+                    ctx.fillRect(x - faceRadius, y - faceRadius, faceRadius * 2, faceRadius * 2);
+                    ctx.fillStyle = 'rgba(102, 102, 102, 0.5)';
+                    ctx.font = '24px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('Player ' + (idx + 1), x, y);
+                }
+                
+                // Debug / overlay: draw eyebrows on top of the clipped face, if we have landmarks
+                if (player.faceImage && player.faceImage.width > 0 && player.faceImage.height > 0 && player.landmarks) {
+                    drawPlayerEyebrows(player, x, y, faceRadius);
+                }
+                
+                ctx.restore();
+            });
+
+            // Update game objects
+            players.forEach(player => player.updatePaddle());
+            ball.update();
+            checkPaddleCollision();
+
+            // Draw center line
+            ctx.strokeStyle = '#444';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([10, 10]);
+            ctx.beginPath();
+            ctx.moveTo(WIDTH / 2, 0);
+            ctx.lineTo(WIDTH / 2, HEIGHT);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Draw paddles (on top of everything)
+            players.forEach((player, idx) => {
+                const x = idx === 0 ? 5 : WIDTH - 15;
+                
+                // Draw paddle shadow
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+                ctx.fillRect(x - 2, player.paddleY - paddleHeight + 2, paddleWidth + 4, paddleHeight * 2);
+                
+                // Draw paddle
+                ctx.fillStyle = player.color;
+                ctx.fillRect(x, player.paddleY - paddleHeight, paddleWidth, paddleHeight * 2);
+            });
+
+            // Draw ball
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Draw scores (on top, with shadow for visibility)
+            const fontSize = Math.min(60, Math.max(30, WIDTH / 20));
+            ctx.font = `bold ${fontSize}px Arial`;
+            ctx.textAlign = 'center';
+            
+            // Score shadows
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+            ctx.fillText(players[0].score, WIDTH * 0.25 + 2, fontSize + 22);
+            ctx.fillText(players[1].score, WIDTH * 0.75 + 2, fontSize + 22);
+            
+            // Actual scores
+            ctx.fillStyle = players[0].color;
+            ctx.fillText(players[0].score, WIDTH * 0.25, fontSize + 20);
+            ctx.fillStyle = players[1].color;
+            ctx.fillText(players[1].score, WIDTH * 0.75, fontSize + 20);
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        async function startGame() {
+            if (gameRunning) return;
+
+            startBtn.disabled = true;
+            statusDiv.textContent = 'Initializing camera...';
+
+            try {
+                if (!faceMesh) {
+                    initFaceDetection();
+                }
+                
+                await camera.start();
+                gameRunning = true;
+                statusDiv.textContent = 'Game running! Raise your eyebrows to move your paddle up.';
+                startBtn.textContent = 'Stop Game';
+                startBtn.disabled = false;
+                gameLoop();
+            } catch (error) {
+                console.error('Failed to start camera:', error);
+                statusDiv.textContent = 'Failed to access camera. Please ensure you have granted camera permissions.';
+                startBtn.disabled = false;
+            }
+        }
+
+        function stopGame() {
+            gameRunning = false;
+            if (camera) {
+                camera.stop();
+            }
+            startBtn.textContent = 'Start Game';
+            statusDiv.textContent = 'Game stopped. Click "Start Game" to begin again.';
+        }
+
+        function toggleVideo() {
+            const showVideo = document.getElementById('showVideo').checked;
+            video.style.display = showVideo ? 'block' : 'none';
+            video.style.opacity = showVideo ? '0.3' : '0';
+        }
+
+        function toggleDebug() {
+            const showDebug = document.getElementById('showDebug').checked;
+            debugDiv.style.display = showDebug ? 'block' : 'none';
+        }
+
+        startBtn.addEventListener('click', () => {
+            if (gameRunning) {
+                stopGame();
+            } else {
+                startGame();
+            }
+        });
+
+        // Start with a simple animation
+        function initialAnimation() {
+            if (gameRunning) return;
+            
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+            
+            // Draw placeholder paddles
+            ctx.fillStyle = '#666';
+            ctx.fillRect(5, HEIGHT/2 - paddleHeight, paddleWidth, paddleHeight * 2);
+            ctx.fillRect(WIDTH - 15, HEIGHT/2 - paddleHeight, paddleWidth, paddleHeight * 2);
+            
+            // Draw title
+            ctx.fillStyle = '#fff';
+            const textSize = Math.min(36, Math.max(18, WIDTH / 30));
+            ctx.font = `${textSize}px Arial`;
+            ctx.textAlign = 'center';
+            ctx.fillText('Click "Start Game" to begin', WIDTH/2, HEIGHT/2);
+            ctx.textAlign = 'left';
+            
+            requestAnimationFrame(initialAnimation);
+        }
+        
+        initialAnimation();
+    </script>
+</body>
+</html>
