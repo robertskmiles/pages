@@ -170,7 +170,7 @@
             updatePaddle() {
                 // Smooth paddle movement
                 const diff = this.targetY - this.paddleY;
-                this.paddleY += diff * 0.15;
+                this.paddleY += diff * 0.07;
             }
         }
 
@@ -321,9 +321,9 @@
                     const player = players[playerIdx];
 
                     // Capture face region
-                    const padding = 1; // Add some padding around the face
-                    const faceWidth = (face.maxX - face.minX) * faceCanvas.width * padding;
-                    const faceHeight = (face.maxY - face.minY) * faceCanvas.height * padding;
+                    const faceScale = 0.95;
+                    const faceWidth = (face.maxX - face.minX) * faceCanvas.width * faceScale;
+                    const faceHeight = (face.maxY - face.minY) * faceCanvas.height * faceScale;
                     const faceCenterX = face.centerX * faceCanvas.width;
                     const faceCenterY = face.centerY * faceCanvas.height;
 
